@@ -4,30 +4,18 @@ import (
 	"encoding/json"
 	"flag"
 	"github.com/PuerkitoBio/goquery"
-	"github.com/robertkrimen/otto"
+	"github.com/beyondblog/wechat-spider/spider"
+	"github.com/coreos/etcd/client"
+	"github.com/labstack/echo"
+	"github.com/labstack/echo/engine/fasthttp"
+	"golang.org/x/net/context"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 )
-
-type WechatArticle struct {
-	//日期
-	Date int64 `json: "date"`
-	//标题
-	Title string `json:"title"`
-	//文章地址
-	Url string `json:"url"`
-	//摘要
-	Digest string `json: "digest"`
-	//缩略图
-	Thumbnail string `json:"thumbnail"`
-	//来源
-	SourceUrl string `json: "source_url"`
-}
 
 func main() {
 	//log.Println("开始获取代理列表!")
@@ -42,31 +30,151 @@ func main() {
 	//	}(proxy)
 	//}
 
-	wechatName := flag.String("name", "", "公众号")
+	etcd := flag.String("etcd", "http://172.16.0.17:4001", "etcd endpoints")
 	flag.Parse()
 
-	if len(*wechatName) == 0 {
-		log.Fatalln("公众号不能为空")
-	}
+	c, _ := getEtcdClient([]string{*etcd})
 
-	articleList, err := spider(*wechatName, nil)
-	if err != nil {
-		log.Println("获取文章失败")
-		return
-	}
+	api := client.NewKeysAPI(c)
+	go WatchWorkers(api)
 
-	log.Println("最近10条文章如下:")
+	e := echo.New()
+	e.GET("/api/spider", func(c echo.Context) error {
+		wechatName := c.QueryParam("name")
+		if len(wechatName) == 0 {
+			return c.String(http.StatusOK, "公众号不能为空!")
+		}
+		articleList, err := spider.Spider(wechatName, nil)
+		if err != nil {
+			return c.String(http.StatusOK, "获取文章失败")
+		}
+		return c.JSON(http.StatusOK, articleList)
+	})
 
-	for _, article := range articleList {
-		log.Println("================================")
-		log.Println("文章标题:" + article.Title)
-		log.Println("地址:" + article.Url)
-		log.Println("缩略图:" + article.Thumbnail)
-		log.Println("================================")
-		//spiderArticle(article.Url, nil)
-	}
+	//注册公众号服务
+	e.GET("/api/register", func(c echo.Context) error {
+		wechatName := c.QueryParam("name")
+		if len(wechatName) == 0 {
+			return c.String(http.StatusOK, "公众号不能为空!")
+		}
+
+		id := wechatName + time.Now().Format("20060102")
+
+		if res, err := api.Get(context.Background(), "/spider/wechat/result/"+id, nil); err == nil {
+
+			result := &spider.WechatSpiderResult{}
+			err := json.Unmarshal([]byte(res.Node.Value), result)
+			if err == nil {
+				return c.JSON(http.StatusOK, result)
+			} else {
+				log.Println(" 获取结果失败! ", err)
+			}
+		}
+
+		t := time.Now().Unix()
+
+		task := &spider.WechatSpiderTask{
+			ID:         id,
+			Name:       wechatName,
+			TTL:        86400,
+			Status:     1,
+			Timestamp:  t,
+			UpdateTime: t,
+		}
+
+		value, _ := json.Marshal(task)
+
+		if resp, err := api.Set(context.Background(), "/spider/wechat/task/"+wechatName, string(value), &client.SetOptions{
+			TTL: time.Second * 86400,
+		}); err != nil {
+			log.Println(err)
+			return c.String(http.StatusOK, "注册失败!")
+		} else {
+			log.Printf("%q key has %q value\n", resp.Node.Key, resp.Node.Value)
+			//注册微信抓取服务
+			return c.String(http.StatusOK, "注册成功!")
+		}
+
+	})
+
+	log.Println("服务启动成功!")
+	e.Run(fasthttp.New(":8999"))
 
 }
+
+func WatchWorkers(api client.KeysAPI) {
+	watcher := api.Watcher("/spider/wechat/task/", &client.WatcherOptions{
+		Recursive: true,
+	})
+	log.Println("Starting watch")
+	for {
+		res, err := watcher.Next(context.Background())
+
+		if err != nil {
+			log.Println("Error watch workers:", err)
+			break
+		}
+
+		log.Println("Watch chanage: ", res.Action)
+
+		if res.Action == "set" || res.Action == "update" {
+
+			task := &spider.WechatSpiderTask{}
+			err := json.Unmarshal([]byte(res.Node.Value), task)
+			if err == nil {
+				go ProcessTask(api, task)
+			} else {
+				log.Printf("Error parse:", err)
+			}
+		}
+	}
+
+	log.Println("End watch")
+
+}
+
+func ProcessTask(api client.KeysAPI, task *spider.WechatSpiderTask) {
+	log.Println("开始处理任务: " + task.ID)
+	articleList, err := spider.Spider(task.Name, nil)
+
+	if err != nil {
+		log.Println("抓取失败!")
+	} else {
+		log.Println("抓取成功!")
+		//放到 etcd 里面
+		result := &spider.WechatSpiderResult{
+			ID:        task.ID,
+			Data:      articleList,
+			Timestamp: time.Now().Unix(),
+		}
+
+		value, _ := json.Marshal(result)
+
+		if _, err := api.Set(context.Background(), "/spider/wechat/result/"+task.ID, string(value), &client.SetOptions{
+			TTL: time.Second * 3 * 3600,
+		}); err != nil {
+			log.Println("结果保存失败! ", err)
+		} else {
+			log.Println("任务完成!")
+		}
+	}
+}
+
+func getEtcdClient(endPoints []string) (client.Client, error) {
+
+	cfg := client.Config{
+		Endpoints:               endPoints,
+		Transport:               client.DefaultTransport,
+		HeaderTimeoutPerRequest: time.Second,
+	}
+
+	c, err := client.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 func spiderArticle(url string, proxyUrl *url.URL) {
 	timeout := time.Duration(20 * time.Second) //超时时间
 	var client *http.Client
@@ -93,110 +201,6 @@ func spiderArticle(url string, proxyUrl *url.URL) {
 	}
 
 	log.Println(doc.Find("#js_content").Text())
-}
-
-func spider(wechatName string, proxyUrl *url.URL) ([]WechatArticle, error) {
-	timeout := time.Duration(20 * time.Second) //超时时间
-	var client *http.Client
-	if proxyUrl != nil {
-		client = &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)}}
-	} else {
-		client = &http.Client{Timeout: timeout}
-	}
-
-	profile, cookie := getProfile(client, wechatName)
-	if profile == "" {
-		return nil, nil
-	}
-	log.Println(profile)
-
-	req, err := http.NewRequest("GET", profile, nil)
-
-	for _, c := range cookie {
-		req.AddCookie(c)
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/34.0.1847.116 Safari/537.36")
-	req.Header.Set("Referer", "http://weixin.sogou.com/weixin?type=1&query="+wechatName+"&ie=utf8&_sug_=n&_sug_type_=")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Println(err)
-		return nil, err
-	}
-
-	defer resp.Body.Close()
-	body, _ := ioutil.ReadAll(resp.Body)
-	log.Println(string(body))
-
-	r, _ := regexp.Compile("<script[\\s\\S]*?>([\\s\\S]*?)</script>")
-	result := r.FindAllStringSubmatch(string(body), -1)
-
-	//初始化一些垃圾玩意
-	js := "window = {}; location={};document = {};getQueryFromURL = function() {return {}};seajs = {}; seajs.use = function() {}"
-	for i := range result {
-		if i == 2 || i == 7 {
-			js += result[i][1]
-		}
-	}
-
-	vm := otto.New()
-
-	js += `
-		   var obj = [];
-	       var lists = JSON.parse(msgList.html()).list
-		   lists.forEach(function(item) {
-			   var msg = item.app_msg_ext_info;
-			   obj.push({date: item.comm_msg_info.datetime , title: msg.title, thumbnail: msg.cover, url: "http://mp.weixin.qq.com" +  msg.content_url.html(), digest: msg.digest, source_url: msg.source_url})
-		   });
-
-		   var result = JSON.stringify(obj);
-
-	`
-	if _, err := vm.Run(js); err != nil {
-		return nil, err
-	}
-
-	val, e := vm.Get("result")
-	if e != nil {
-		return nil, e
-	}
-
-	articles := []WechatArticle{}
-	json.Unmarshal([]byte(val.String()), &articles)
-	return articles, nil
-}
-
-func getProfile(client *http.Client, name string) (string, []*http.Cookie) {
-	req, err := http.NewRequest("GET", "http://weixin.sogou.com/weixin?type=1&query="+name+"&ie=utf8&_sug_=n&_sug_type_=", nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/34.0.1847.116 Safari/537.36")
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Println(err)
-		return "", nil
-	}
-	defer resp.Body.Close()
-
-	doc, err := goquery.NewDocumentFromResponse(resp)
-
-	if err != nil {
-		log.Println(err)
-		return "", nil
-	}
-
-	profile := ""
-
-	doc.Find(".wx-rb").EachWithBreak(func(i int, s *goquery.Selection) bool {
-		// For each item found, get the band and title
-		weixinhao := s.Find("label[name='em_weixinhao']").Text()
-		if weixinhao == name {
-			val, _ := s.Attr("href")
-			profile = val
-			return false
-		}
-		return true
-	})
-
-	return profile, resp.Cookies()
 }
 
 //从代理服务器取 ip
