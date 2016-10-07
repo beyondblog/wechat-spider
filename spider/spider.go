@@ -2,6 +2,7 @@ package spider
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/robertkrimen/otto"
 	"io/ioutil"
@@ -19,6 +20,7 @@ type WechatSpiderTask struct {
 	TTL        time.Duration `json:"ttl"`
 	Timestamp  int64         `json:"timestamp"`
 	UpdateTime int64         `json:"updateTime"`
+	Note       string        `json:"note"`
 }
 
 type WechatSpiderResult struct {
@@ -45,9 +47,15 @@ func Spider(wechatName string, proxyUrl *url.URL) ([]WechatArticle, error) {
 		client = &http.Client{Timeout: timeout}
 	}
 
-	profile, cookie := getProfile(client, wechatName)
+	profile, cookie, err := getProfile(client, wechatName)
+
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
 	if profile == "" {
-		return nil, nil
+		return nil, fmt.Errorf("%s", "公众号不存在或代理失效!")
 	}
 	log.Println(profile)
 
@@ -107,21 +115,18 @@ func Spider(wechatName string, proxyUrl *url.URL) ([]WechatArticle, error) {
 	return articles, nil
 }
 
-func getProfile(client *http.Client, name string) (string, []*http.Cookie) {
+func getProfile(client *http.Client, name string) (string, []*http.Cookie, error) {
 	req, err := http.NewRequest("GET", "http://weixin.sogou.com/weixin?type=1&query="+name+"&ie=utf8&_sug_=n&_sug_type_=", nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/34.0.1847.116 Safari/537.36")
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Println(err)
-		return "", nil
+		return "", nil, err
 	}
-	defer resp.Body.Close()
 
 	doc, err := goquery.NewDocumentFromResponse(resp)
 
 	if err != nil {
-		log.Println(err)
-		return "", nil
+		return "", nil, err
 	}
 
 	profile := ""
@@ -130,12 +135,17 @@ func getProfile(client *http.Client, name string) (string, []*http.Cookie) {
 		// For each item found, get the band and title
 		weixinhao := s.Find("label[name='em_weixinhao']").Text()
 		if weixinhao == name {
-			val, _ := s.Attr("href")
-			profile = val
+			profile, _ = s.Attr("href")
 			return false
 		}
 		return true
 	})
 
-	return profile, resp.Cookies()
+	//如果没有则默认取第一个
+
+	if profile == "" {
+		profile, _ = doc.Find(".wx-rb").Eq(0).Attr("href")
+	}
+
+	return profile, resp.Cookies(), nil
 }
